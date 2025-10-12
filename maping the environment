@@ -1,0 +1,408 @@
+from controller import Robot, DistanceSensor, Lidar
+import random
+import heapq
+import math
+import time
+
+# ====== PARAMETERS ======
+TIME_STEP = 64
+MAX_SPEED = 3.0
+OBSTACLE_THRESHOLD = 1.0  # meters
+CRITICAL_THRESHOLD = 0.3  # meters
+
+# MAP PARAMETERS
+MAP_SIZE = 20            # Grid size (20x20)
+CELL_SIZE = 0.2          # Each cell = 0.2m x 0.2m → 20*0.2=4m total coverage
+GOAL = (18, 18)          # Goal in grid coordinates (row, col)
+START = (10, 10)         # Start position (assumed center)
+
+# ====== INIT ROBOT ======
+robot = Robot()
+
+# Motors
+left_motor = robot.getDevice("wheel_left_joint")
+right_motor = robot.getDevice("wheel_right_joint")
+left_motor.setPosition(float('inf'))
+right_motor.setPosition(float('inf'))
+left_motor.setVelocity(0)
+right_motor.setVelocity(0)
+
+# LiDAR
+lidar = None
+try:
+    lidar = robot.getDevice("Hokuyo URG-04LX-UG01")
+    lidar.enable(TIME_STEP)
+    print("✓ LiDAR sensor enabled")
+except:
+    print("✗ LiDAR sensor not found")
+
+# Distance sensors
+sensors = []
+sensor_names = [
+    "base_sonar_01", "base_sonar_02", "base_sonar_03", "base_sonar_04",
+    "sonar_01", "sonar_02", "sonar_03", "sonar_04",
+    "base_laser_01", "base_laser_02", "base_laser_03",
+    "front_laser", "left_laser", "right_laser", "back_laser"
+]
+
+for name in sensor_names:
+    try:
+        sensor = robot.getDevice(name)
+        if sensor is not None:
+            sensor.enable(TIME_STEP)
+            sensors.append(sensor)
+            print(f"✓ Enabled sensor: {name}")
+    except:
+        continue
+
+print(f"Total distance sensors enabled: {len(sensors)}")
+
+if len(sensors) == 0 and lidar is None:
+    print("⚠ No sensors found! Robot will move randomly.")
+
+# ====== MAP & PATHFINDING ======
+class GridMap:
+    def __init__(self, size, cell_size):
+        self.size = size
+        self.cell_size = cell_size
+        self.grid = [[0 for _ in range(size)] for _ in range(size)]  # 0: free, 1: obstacle
+        self.robot_pos = START  # (row, col)
+        self.goal = GOAL
+        self.path = []
+
+    def world_to_grid(self, x, y):
+        """Convert world coordinates (meters) to grid indices"""
+        row = int((y + self.size * self.cell_size / 2) / self.cell_size)
+        col = int((x + self.size * self.cell_size / 2) / self.cell_size)
+        return max(0, min(self.size - 1, row)), max(0, min(self.size - 1, col))
+
+    def update_map_from_lidar(self):
+        """Update grid using LiDAR data"""
+        if lidar is None:
+            return
+
+        try:
+            ranges = lidar.getRangeImage()
+            num_points = len(ranges)
+            if num_points == 0:
+                return
+
+            # LiDAR field of view: typically ~270 degrees (adjust if needed)
+            angle_min = -2.356  # -135 deg in radians
+            angle_max = 2.356   # +135 deg
+            angle_step = (angle_max - angle_min) / num_points
+
+            # Get robot's approximate pose (assume facing +Y axis, origin at center)
+            # You can enhance this with odometry later
+            robot_x, robot_y = 0.0, 0.0  # Center of map
+
+            for i in range(num_points):
+                distance = ranges[i]
+                if distance > OBSTACLE_THRESHOLD or distance == float('inf'):
+                    continue  # Skip far or invalid readings
+
+                angle = angle_min + i * angle_step
+                # Calculate obstacle position in world coords
+                obs_x = robot_x + distance * math.cos(angle)
+                obs_y = robot_y + distance * math.sin(angle)
+
+                # Convert to grid
+                grid_row, grid_col = self.world_to_grid(obs_x, obs_y)
+                self.grid[grid_row][grid_col] = 1  # Mark as obstacle
+
+                # Also mark nearby cells as occupied for robustness
+                for dr in [-1, 0, 1]:
+                    for dc in [-1, 0, 1]:
+                        nr, nc = grid_row + dr, grid_col + dc
+                        if 0 <= nr < self.size and 0 <= nc < self.size:
+                            self.grid[nr][nc] = 1
+
+        except Exception as e:
+            print(f"⚠ LiDAR update error: {e}")
+
+    def update_map_from_sensors(self):
+        """Use front-facing sensors to mark obstacles ahead"""
+        if not sensors:
+            return
+
+        sensor_values = []
+        for sensor in sensors:
+            try:
+                val = sensor.getValue()
+                if val > 1000: val /= 1000.0  # mm to m
+                sensor_values.append(val)
+            except:
+                sensor_values.append(float('inf'))
+
+        # Assume first sensor is front-facing
+        if len(sensor_values) > 0 and sensor_values[0] < OBSTACLE_THRESHOLD:
+            # Estimate direction: assume robot faces +Y
+            # Mark a few cells ahead as occupied
+            robot_row, robot_col = self.robot_pos
+            # Forward direction: +Y → row decreases if Y-up is up in grid?
+            # Let's assume: grid[0][0] = top-left, Y increases downward
+            # So moving forward in +Y means increasing row index
+            for d in range(1, 3):  # Mark 1-2 cells ahead
+                next_row = robot_row + d
+                if next_row < self.size:
+                    self.grid[next_row][robot_col] = 1
+
+    def get_robot_position(self):
+        """Return current robot position in grid (simulated)"""
+        # In real use, you'd use odometry. Here we simulate it.
+        # For now, just return static start, but you could integrate wheel encoders later.
+        return self.robot_pos
+
+    def set_robot_position(self, row, col):
+        self.robot_pos = (row, col)
+
+    def a_star(self, start, goal):
+        """A* pathfinding on grid"""
+        def heuristic(a, b):
+            return abs(a[0] - b[0]) + abs(a[1] - b[1])  # Manhattan distance
+
+        open_set = [(0, start)]
+        came_from = {}
+        g_score = {start: 0}
+        f_score = {start: heuristic(start, goal)}
+
+        neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]  # 4-directional
+
+        while open_set:
+            _, current = heapq.heappop(open_set)
+
+            if current == goal:
+                # Reconstruct path
+                path = []
+                while current in came_from:
+                    path.append(current)
+                    current = came_from[current]
+                path.reverse()
+                return path
+
+            for dx, dy in neighbors:
+                neighbor = (current[0] + dx, current[1] + dy)
+                if not (0 <= neighbor[0] < self.size and 0 <= neighbor[1] < self.size):
+                    continue
+                if self.grid[neighbor[0]][neighbor[1]] == 1:
+                    continue
+
+                tentative_g = g_score[current] + 1
+                if neighbor not in g_score or tentative_g < g_score[neighbor]:
+                    came_from[neighbor] = current
+                    g_score[neighbor] = tentative_g
+                    f_score[neighbor] = tentative_g + heuristic(neighbor, goal)
+                    heapq.heappush(open_set, (f_score[neighbor], neighbor))
+
+        return []  # No path found
+
+    def print_map(self):
+        """Print ASCII map to terminal"""
+        print("\n" + "="*60)
+        print("🗺  MAP (Top-left = (0,0))")
+        print("R = Robot | S = Start | G = Goal | # = Obstacle | . = Free | * = Path")
+        print("="*60)
+
+        for r in range(self.size):
+            row_str = ""
+            for c in range(self.size):
+                cell = self.grid[r][c]
+                pos = (r, c)
+                if pos == self.robot_pos:
+                    row_str += " R "
+                elif pos == START:
+                    row_str += " S "
+                elif pos == GOAL:
+                    row_str += " G "
+                elif pos in self.path:
+                    row_str += " * "
+                elif cell == 1:
+                    row_str += " # "
+                else:
+                    row_str += " . "
+            print(row_str)
+        print("="*60)
+
+
+# Initialize map
+grid_map = GridMap(MAP_SIZE, CELL_SIZE)
+
+# ====== FUNCTIONS ======
+def move(left_speed, right_speed):
+    left_motor.setVelocity(left_speed)
+    right_motor.setVelocity(right_speed)
+
+def get_sensor_values():
+    values = []
+    for sensor in sensors:
+        try:
+            value = sensor.getValue()
+            if value > 1000:
+                value = value / 1000.0
+            values.append(value)
+        except:
+            values.append(float('inf'))
+    return values
+
+def detect_obstacles():
+    if lidar is not None:
+        return get_lidar_data()
+    else:
+        sensor_values = get_sensor_values()
+        if not sensor_values:
+            return False, False, False
+        front_obs = min(sensor_values) < OBSTACLE_THRESHOLD
+        left_obs = False
+        right_obs = False
+        if len(sensor_values) >= 2:
+            # Roughly assign based on sensor order
+            if sensor_values[1] < OBSTACLE_THRESHOLD:
+                left_obs = True
+            if len(sensor_values) >= 3 and sensor_values[2] < OBSTACLE_THRESHOLD:
+                right_obs = True
+        return front_obs, left_obs, right_obs
+
+def get_lidar_data():
+    if lidar is None:
+        return False, False, False
+    try:
+        ranges = lidar.getRangeImage()
+        if not ranges:
+            return False, False, False
+        num_points = len(ranges)
+        front_start = int(num_points * 0.4)
+        front_end = int(num_points * 0.6)
+        left_start = int(num_points * 0.6)
+        left_end = int(num_points * 0.8)
+        right_start = int(num_points * 0.2)
+        right_end = int(num_points * 0.4)
+
+        front = any(r < OBSTACLE_THRESHOLD for r in ranges[front_start:front_end] if r != float('inf'))
+        left = any(r < OBSTACLE_THRESHOLD for r in ranges[left_start:left_end] if r != float('inf'))
+        right = any(r < OBSTACLE_THRESHOLD for r in ranges[right_start:right_end] if r != float('inf'))
+        return front, left, right
+    except:
+        return False, False, False
+
+def obstacle_avoidance():
+    front_obstacle, left_obstacle, right_obstacle = detect_obstacles()
+    all_values = get_sensor_values()
+    min_distance = min(all_values) if all_values else OBSTACLE_THRESHOLD + 1
+
+    if min_distance < CRITICAL_THRESHOLD:
+        move(0, 0)
+        print("🛑 EMERGENCY STOP - Obstacle too close!")
+        return
+
+    speed_factor = min(1.0, min_distance / OBSTACLE_THRESHOLD)
+    current_speed = MAX_SPEED * max(0.3, speed_factor)
+
+    if front_obstacle:
+        print(f"🚧 Front obstacle detected! Distance: {min_distance:.2f}m")
+        if not right_obstacle:
+            move(-current_speed * 0.5, current_speed * 0.8)
+            print("↪ Turning right")
+        elif not left_obstacle:
+            move(current_speed * 0.8, -current_speed * 0.5)
+            print("↩ Turning left")
+        else:
+            move(-current_speed * 0.4, current_speed * 0.6)
+            print("⬅ Backing up and turning right")
+    elif left_obstacle:
+        print(f"🚧 Left obstacle detected! Distance: {min_distance:.2f}m")
+        move(current_speed * 0.9, current_speed * 0.5)
+        print("↪ Steering away from left")
+    elif right_obstacle:
+        print(f"🚧 Right obstacle detected! Distance: {min_distance:.2f}m")
+        move(current_speed * 0.5, current_speed * 0.9)
+        print("↩ Steering away from right")
+    else:
+        move(current_speed, current_speed)
+        print(f"✅ Path clear - Moving forward at {current_speed:.1f}")
+
+def follow_path(path, grid_map):
+    """Move robot toward next point in path"""
+    if not path:
+        return False
+
+    # Target next waypoint
+    target_row, target_col = path[0]
+    current_row, current_col = grid_map.get_robot_position()
+
+    # Simple directional movement: assume robot faces +Y (down in grid)
+    # Grid: (0,0) = top-left, row increases down, col increases right
+    # Robot orientation: assumed facing +Y (down)
+
+    if target_row > current_row:
+        # Go down (forward)
+        move(MAX_SPEED, MAX_SPEED)
+        print("➡️ Moving forward toward path")
+    elif target_row < current_row:
+        # Go up (backward)
+        move(-MAX_SPEED, -MAX_SPEED)
+        print("⬅️ Moving backward toward path")
+    elif target_col > current_col:
+        # Go right
+        move(MAX_SPEED, -MAX_SPEED)
+        print("↪ Turning right toward path")
+    elif target_col < current_col:
+        # Go left
+        move(-MAX_SPEED, MAX_SPEED)
+        print("↩ Turning left toward path")
+    else:
+        # Reached point
+        path.pop(0)
+        print(f"🎯 Reached waypoint {target_row},{target_col}, remaining: {len(path)}")
+        return True  # Waypoint reached
+
+    return False  # Still moving
+
+# ====== MAIN LOOP ======
+step_count = 0
+last_replan_time = 0
+path = []
+
+print("🤖 Starting TIAGo Hybrid Navigation System...")
+print(f"Map size: {MAP_SIZE}x{MAP_SIZE} ({MAP_SIZE * CELL_SIZE}m x {MAP_SIZE * CELL_SIZE}m)")
+print(f"Goal: {GOAL} | Start: {START}")
+print("=" * 60)
+
+while robot.step(TIME_STEP) != -1:
+    step_count += 1
+
+    # Update map every 5 steps
+    if step_count % 5 == 0:
+        grid_map.update_map_from_lidar()
+        grid_map.update_map_from_sensors()
+
+    # Replan path every 20 steps or if no path
+    if step_count % 20 == 0 or not path:
+        print(f"\n🔄 Replanning path at step {step_count}...")
+        grid_map.set_robot_position(*grid_map.get_robot_position())  # Ensure sync
+        path = grid_map.a_star(grid_map.get_robot_position(), GOAL)
+        grid_map.path = path
+        if path:
+            print(f"✅ New path found: {len(path)} waypoints")
+        else:
+            print("❌ No path found to goal!")
+
+    # Print map every 50 steps
+    if step_count % 50 == 0:
+        grid_map.print_map()
+
+    # Follow path if available
+    if path:
+        if follow_path(path, grid_map):
+            # Waypoint reached, continue
+            pass
+    else:
+        # No path? Use obstacle avoidance only
+        obstacle_avoidance()
+
+    # Print status every 100 steps
+    if step_count % 100 == 0:
+        print(f"\n--- Step {step_count} | Time: {step_count * TIME_STEP / 1000:.1f}s ---")
+        sensor_vals = get_sensor_values()
+        print(f"Sensors: {len(sensors)} | LiDAR: {'Yes' if lidar else 'No'}")
+        if sensor_vals:
+            print(f"Distances: {[f'{v:.2f}m' for v in sensor_vals[:4]]}")

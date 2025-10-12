@@ -1,0 +1,67 @@
+from controller import Robot, Camera
+import cv2
+import numpy as np
+from pyzbar.pyzbar import decode
+
+# -------- User input from VS Code terminal --------
+target_book = input("Enter the book name to find: ").strip().lower()
+
+# Simulated barcode database
+book_database = {
+    "9780134685991": "Dune",
+    "9781492051367": "python",
+    "9780262035613": "Game of thrones",
+    "9780131103627": "Calculas 2",
+    "9780136042594": "AI for kids"
+}
+
+# -------- Initialize Robot and Camera --------
+robot = Robot()
+camera = robot.getDevice("Astra rgb")
+camera.enable(64)
+
+print("\n📡 Scanning books... Press 'q' to stop.\n")
+
+book_found = False
+
+# -------- Main Loop --------
+while robot.step(64) != -1:
+    image = camera.getImage()
+    width = camera.getWidth()
+    height = camera.getHeight()
+    
+    img_array = np.frombuffer(image, np.uint8).reshape((height, width, 4))
+    img_bgr = cv2.cvtColor(img_array, cv2.COLOR_BGRA2BGR)
+    
+    barcodes = decode(img_bgr)
+    
+    for barcode in barcodes:
+        (x, y, w, h) = barcode.rect
+        barcode_data = barcode.data.decode("utf-8")
+        
+        cv2.rectangle(img_bgr, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.putText(img_bgr, barcode_data, (x, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        
+        if barcode_data in book_database:
+            book_name = book_database[barcode_data].lower()
+            print(f"Detected book: {book_name}")
+            
+            if target_book in book_name:
+                print(f"\n Book FOUND: {book_database[barcode_data]}\n")
+                book_found = True
+                break
+            else:
+                print(f" Not the target book: {book_database[barcode_data]}")
+        else:
+            print(f" Unknown barcode: {barcode_data}")
+
+    cv2.imshow("TIAGo Camera - Book Scan", img_bgr)
+    
+    if book_found or cv2.waitKey(1) == ord('q'):
+        break
+
+cv2.destroyAllWindows()
+
+if not book_found:
+    print(f"\n Book '{target_book}' not found on shelf.\n")
