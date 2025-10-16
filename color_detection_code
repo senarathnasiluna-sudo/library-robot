@@ -1,0 +1,153 @@
+from controller import Robot
+import numpy as np
+import cv2
+
+# --- Initialization ---
+TIME_STEP = 64
+robot = Robot()
+
+# Get the camera (check name in Webots Scene Tree)
+camera = robot.getDevice("Astra rgb")
+if camera is None:
+    print("❌ Camera 'Astra rgb' not found! Check the device name in Webots.")
+    exit(1)
+
+camera.enable(TIME_STEP)
+
+# Define color ranges in HSV (OpenCV format: H: 0–180, S: 0–255, V: 0–255)
+# Use trackbars later if you need to fine-tune
+COLOR_RANGES = {
+    "Biography": {  # Purple
+        "lower": np.array([130, 100, 50]),
+        "upper": np.array([150, 255, 255]),
+        "color": (255, 0, 127),  # BGR for display
+        "shortcut": "🟣"
+    },
+    "History": {  # Red (two ranges because red wraps around)
+        "lower": np.array([0, 100, 50]),
+        "upper": np.array([10, 255, 255]),
+        "color": (0, 0, 255),
+        "shortcut": "🔴"
+    },
+    "History2": {  # Second red range
+        "lower": np.array([170, 100, 50]),
+        "upper": np.array([180, 255, 255]),
+        "color": (0, 0, 255),
+        "shortcut": "🔴"
+    },
+    "Mystery": {  # Green
+        "lower": np.array([40, 100, 50]),
+        "upper": np.array([80, 255, 255]),
+        "color": (0, 255, 0),
+        "shortcut": "🟢"
+    },
+    "Fiction": {  # Blue
+        "lower": np.array([90, 100, 50]),
+        "upper": np.array([130, 255, 255]),
+        "color": (255, 0, 0),
+        "shortcut": "🔵"
+    },
+    "Science_Fiction": {  # Yellow
+        "lower": np.array([20, 100, 50]),
+        "upper": np.array([40, 255, 255]),
+        "color": (0, 255, 255),
+        "shortcut": "🟡"
+    }
+}
+
+# Minimum pixel count to count as a valid detection
+MIN_PIXELS = 800
+
+print("✅ Multi-Book Color Detector Active")
+print("📊 Detecting: Purple, Red, Green, Blue, Yellow")
+print("📌 Press [ESC] to exit\n")
+
+while robot.step(TIME_STEP) != -1:
+    width = camera.getWidth()
+    height = camera.getHeight()
+    image = camera.getImage()
+
+    if image is None:
+        continue
+
+    # Convert to OpenCV image
+    img = np.frombuffer(image, np.uint8).reshape((height, width, 4))
+    frame_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    frame_hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+
+    # Create output frame for visualization
+    display_frame = frame_bgr.copy()
+    detected_categories = []
+
+    # Morphological kernel
+    kernel = np.ones((5, 5), np.uint8)
+
+    # Check each color
+    for label, color_info in COLOR_RANGES.items():
+        lower = color_info["lower"]
+        upper = color_info["upper"]
+        display_color = color_info["color"]
+
+        # Create mask
+        mask = cv2.inRange(frame_hsv, lower, upper)
+
+        # Clean up mask
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+        # Count purple pixels
+        count = cv2.countNonZero(mask)
+
+        # For red, combine both ranges
+        if label == "Fiction2":
+            continue  # Handled below
+
+        if label == "Fiction":
+            # Combine both red masks
+            mask2 = cv2.inRange(frame_hsv, COLOR_RANGES["History2"]["lower"], COLOR_RANGES["History2"]["upper"])
+            mask2 = cv2.morphologyEx(mask2, cv2.MORPH_OPEN, kernel)
+            mask2 = cv2.morphologyEx(mask2, cv2.MORPH_CLOSE, kernel)
+            mask = cv2.bitwise_or(mask, mask2)
+            count = cv2.countNonZero(mask)
+
+        # Check if enough pixels
+        if count > MIN_PIXELS:
+            # Avoid duplicate category (e.g., Fiction from two masks)
+            base_label = label.split("2")[0] if "2" in label else label
+            if base_label not in [cat["label"] for cat in detected_categories]:
+                print(f"{color_info['shortcut']} {base_label} detected! ({count} pixels)")
+                detected_categories.append({
+                    "label": base_label,
+                    "count": count,
+                    "color": display_color
+                })
+
+        # Optional: Show all masks (comment out if too many windows)
+        # cv2.imshow(f"Mask: {label}", mask)
+
+    # Draw all detected labels on screen
+    y_pos = 30
+    for cat in detected_categories:
+        cv2.putText(display_frame, f"Category: {cat['label']}", (30, y_pos),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, cat["color"], 2)
+        y_pos += 40
+
+    # Show windows
+    cv2.imshow("📚 Book Color Detection", display_frame)
+
+    # Show combined mask (all colors)
+    combined_mask = np.zeros(mask.shape, dtype=np.uint8)
+    for label, color_info in COLOR_RANGES.items():
+        lower = color_info["lower"]
+        upper = color_info["upper"]
+        temp_mask = cv2.inRange(frame_hsv, lower, upper)
+        combined_mask = cv2.bitwise_or(combined_mask, temp_mask)
+    cv2.imshow("🔍 All Color Mask", combined_mask)
+
+    # Exit on ESC
+    if cv2.waitKey(1) == 27:
+        break
+
+# Cleanup
+cv2.destroyAllWindows()
+print("👋 Multi-color detection ended.")
